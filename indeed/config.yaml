@@ -1,0 +1,8 @@
+get_job_ids:
+  defaults:
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    headless: true
+    base_url: "https://ca.indeed.com/jobs"
+    network_idle_timeout: 60000
+    job_count_class: "jobsearch-JobCountAndSortPane-jobCount"
+    job_link_data_attr: "data-jk"
