@@ -9,7 +9,7 @@ import os
 from django.conf import settings
 import shutil
 import logging
-
+from .scripts.scrape_job_data import extract_job_details
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -84,9 +84,8 @@ def scrape_job_data(request):
                 for file_in_folder in files_in_folder:
                     file_path = os.path.join(folder_path, file_in_folder)
                     try:
-                        with open(file_path, 'r') as file:
-                            # Placeholder for file processing logic
-                            file_content = file.read()
+                        # Call the extract_job_details function and pass the file path
+                        async_to_sync(extract_job_details)(file_path)
 
                         # Append the processed file name to the list
                         processed_files.append(file_in_folder)
@@ -119,9 +118,8 @@ def scrape_job_data(request):
 
             # Process the provided file
             try:
-                with open(file_path, 'r') as file:
-                    # Placeholder for file processing logic
-                    file_content = file.read()
+                # Call the extract_job_details function and pass the file path
+                async_to_sync(extract_job_details)(file_path)
 
                 # Move the file to the 'completed' folder after processing
                 shutil.move(file_path, os.path.join(completed_folder_path, file_name))
