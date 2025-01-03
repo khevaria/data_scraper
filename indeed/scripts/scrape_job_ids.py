@@ -14,117 +14,175 @@ import uuid  # For scrape_session_id
 from django.utils import timezone
 from asgiref.sync import sync_to_async
 
-# Import settings from Django
+# Django settings and model imports
 from django.conf import settings
+from indeed.models import JobRecord
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load configuration from YAML file using settings.BASE_DIR
-config_path = os.path.join(settings.BASE_DIR, 'indeed', 'config.yaml')
-logger.info(f"Loading configuration from {config_path}")
+# For loading cookies
+import json
 
-try:
-    with open(config_path, 'r') as config_file:
-        config = yaml.safe_load(config_file)
-        job_scraper_config = config['get_job_ids']['defaults']
-except FileNotFoundError as e:
-    logger.error(f"Configuration file not found: {e}")
-    # Handle the error as needed
-except yaml.YAMLError as e:
-    logger.error(f"Error parsing YAML configuration: {e}")
-    # Handle the error as needed
 
-# Define output directory path using settings.BASE_DIR
-output_dir = os.path.join(settings.BASE_DIR, 'indeed', 'output', 'pendingExtraction')
+async def load_cookies(context, cookies_file):
+    """
+    Load cookies from a JSON file and add them to the given browser context.
+    Fix any invalid 'sameSite' values to avoid Playwright errors.
+    """
+    try:
+        with open(cookies_file, 'r', encoding='utf-8') as f:
+            cookies = json.load(f)
+            for cookie in cookies:
+                # Only "None", "Lax", or "Strict" are valid in Playwright
+                if 'sameSite' in cookie and cookie['sameSite'] not in ['Strict', 'Lax', 'None']:
+                    logger.warning(
+                        f"Invalid sameSite value '{cookie['sameSite']}' "
+                        f"for cookie '{cookie['name']}'. Setting to 'Lax'."
+                    )
+                    cookie['sameSite'] = 'Lax'
+            await context.add_cookies(cookies)
+            logger.info(f"Cookies loaded successfully from {cookies_file}.")
+    except FileNotFoundError:
+        logger.warning(f"Cookies file not found: {cookies_file} – skipping cookies load.")
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse cookies JSON: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error loading cookies: {e}")
 
-# Log the output directory path
-logger.info(f"Output directory: {output_dir}")
 
-# Define a pool of user agents
+# A small pool of user agents (add more if desired)
 USER_AGENT_POOL = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'
-    ' Chrome/91.0.4472.124 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'
-    ' Chrome/90.0.4430.93 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'
-    ' Chrome/89.0.4389.128 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'
-    ' Chrome/88.0.4324.150 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)'
-    ' Chrome/91.0.4472.124 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)'
-    ' Chrome/90.0.4430.93 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)'
-    ' Chrome/89.0.4389.128 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)'
-    ' Chrome/88.0.4324.150 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)'
-    ' Chrome/91.0.4472.124 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)'
-    ' Chrome/90.0.4430.93 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.93 Safari/537.36',
+
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+
+    'Mozilla/5.0 (X11; Linux x86_64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
 ]
 
-# Import your Django model
-from indeed.models import JobRecord
 
+async def extract_job_ids(
+        job_title=None,
+        location=None,
+        user_agent=None,
+        headless=False,  # Run with UI (headed) by default
+        base_url="https://ca.indeed.com/jobs",
+        network_idle_timeout=60000,
+        job_count_class="searchCount",
+        job_link_data_attr="data-jk"):
 
-async def extract_job_ids(job_title=None, location=None, user_agent=None, headless=None,
-                          base_url=None, network_idle_timeout=None, job_count_class=None,
-                          job_link_data_attr=None):
     logger.info("Starting the extraction process...")
-
-    # Record the start time
+    base_url = "https://ca.indeed.com/jobs"
     start_time = timezone.now()
-
     scrape_session_id = str(uuid.uuid4())
     logger.info(f"Scrape session ID: {scrape_session_id}")
 
-    # If no user agent is provided, select one randomly from the pool
-    user_agent = user_agent or random.choice(USER_AGENT_POOL)
-    headless = headless if headless is not None else job_scraper_config['headless']
-    base_url = base_url or job_scraper_config['base_url']
-    network_idle_timeout = network_idle_timeout or job_scraper_config['network_idle_timeout']
-    job_count_class = job_count_class or job_scraper_config['job_count_class']
-    job_link_data_attr = job_link_data_attr or job_scraper_config['job_link_data_attr']
+    # Pick a random user agent if none provided
+    if not user_agent:
+        user_agent = random.choice(USER_AGENT_POOL)
 
-    # Initialize counters
+    # Attempt to load extra config from YAML (optional)
+    config_path = os.path.join(settings.BASE_DIR, 'indeed', 'config.yaml')
+    logger.info(f"Loading configuration from {config_path}")
+    try:
+        with open(config_path, 'r') as config_file:
+            config = yaml.safe_load(config_file)
+
+            # This corresponds to the YAML hierarchy:
+            # get_job_ids:
+            #   defaults:
+            #     user_agent: ...
+            job_scraper_config = config['get_job_ids']['defaults']
+
+            # Extract values from your config, with optional fallback to defaults
+            user_agent = job_scraper_config.get('user_agent', user_agent)
+            headless = job_scraper_config.get('headless', headless)
+            base_url = job_scraper_config.get('base_url', base_url)
+            network_idle_timeout = job_scraper_config.get('network_idle_timeout', network_idle_timeout)
+            job_count_class = job_scraper_config.get('job_count_class', job_count_class)
+            job_link_data_attr = job_scraper_config.get('job_link_data_attr', job_link_data_attr)
+    except FileNotFoundError as e:
+        logger.error(f"Configuration file not found: {e}")
+    except yaml.YAMLError as e:
+        logger.error(f"Error parsing YAML configuration: {e}")
+
+    # Output directory for CSV
+    output_dir = os.path.join(settings.BASE_DIR, 'indeed', 'output', 'pendingExtraction')
+    logger.info(f"Output directory: {output_dir}")
+
     total_job_ids_found = 0
     new_job_ids_saved = 0
     all_job_ids = []
 
     async with async_playwright() as p:
-        logger.info("Launching browser with User-Agent: %s", user_agent)
+        logger.info(f"Launching browser with User-Agent: {user_agent}")
         browser = await p.chromium.launch(headless=headless)
 
-        # Set a realistic User-Agent and create a new page
-        context = await browser.new_context(user_agent=user_agent)
+        # Create a more realistic browser context
+        context = await browser.new_context(
+            user_agent=user_agent,
+            viewport={'width': 1366, 'height': 768},
+            locale='en-US',
+            timezone_id='America/New_York'
+        )
+
+        # Set additional HTTP headers
+        await context.set_extra_http_headers({
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Sec-Ch-Ua': '"Chromium";v="91", " Not;A Brand";v="99", "Google Chrome";v="91"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"'
+        })
+
         page = await context.new_page()
 
-        # Apply stealth plugin
+        # Stealth plugin to mask Playwright signals
         await stealth_async(page)
 
-        # Construct the URL for the job search
-        search_url = f"{base_url}?q={job_title}&l={location}"
+        # Load cookies from JSON
+        cookies_file = os.path.join(settings.BASE_DIR, 'indeed', 'cookies.json')
+        await load_cookies(context, cookies_file)
 
+        # Add a random delay to mimic real user "think time"
+        delay = random.uniform(2, 4)
+        logger.info(f"Sleeping for {delay:.2f} seconds to mimic human behavior...")
+        await asyncio.sleep(delay)
+
+        # Minimal mouse movement
+        await page.mouse.move(100, 200)
+        await page.wait_for_timeout(500)
+        await page.mouse.move(200, 300)
+
+        # Construct your search URL
+        search_url = f"{base_url}?q={job_title}&l={location}"
         logger.info(f"Navigating to {search_url}...")
-        # Navigate to the search results page and wait for network to be idle
         await page.goto(search_url, wait_until='networkidle', timeout=network_idle_timeout)
 
-        logger.info("Page loaded. Extracting HTML content...")
-        # Extract the HTML content
+        # Extract the page content
         content = await page.content()
-
-        logger.info("Parsing HTML content with BeautifulSoup...")
-        # Parse the HTML content using BeautifulSoup
         soup = BeautifulSoup(content, 'html.parser')
 
-        logger.info("Finding total number of jobs...")
-        # Find total number of jobs
+        # Attempt to parse total jobs
         job_count_elem = soup.find('div', {'class': job_count_class})
-        job_count_text = job_count_elem.find('span').text if job_count_elem else '0'
-        total_jobs = int(re.search(r'\d+', job_count_text.replace(',', '')).group())
+        job_count_text = '0'
+        if job_count_elem and job_count_elem.find('span'):
+            job_count_text = job_count_elem.find('span').text
+
+        match = re.search(r'\d+', job_count_text.replace(',', ''))
+        if match:
+            total_jobs = int(match.group())
+        else:
+            total_jobs = 0
 
         logger.info(f"Total number of jobs: {total_jobs}")
 
@@ -133,40 +191,27 @@ async def extract_job_ids(job_title=None, location=None, user_agent=None, headle
         logger.info(f"Total number of pages: {total_pages}")
 
         for page_num in range(total_pages):
-            start = page_num * 10  # Calculate the start parameter
+            start = page_num * 10
             page_url = f'{search_url}&start={start}'
             logger.info(f"Navigating to {page_url}...")
             try:
                 await page.goto(page_url, wait_until='networkidle', timeout=network_idle_timeout)
-
-                logger.info("Page loaded. Extracting HTML content...")
-                # Extract the HTML content
                 content = await page.content()
-
-                logger.info("Parsing HTML content with BeautifulSoup...")
-                # Parse the HTML content using BeautifulSoup
                 soup = BeautifulSoup(content, 'html.parser')
 
-                logger.info(f"Finding all <a> tags with {job_link_data_attr} attribute...")
-                # Find all <a> tags with the job links containing the data-jk attribute
                 job_links = soup.find_all('a', {job_link_data_attr: True})
-
                 if not job_links:
-                    logger.warning(f"No job links found on page {page_num + 1}. Please check the HTML structure.")
+                    logger.warning(f"No job links found on page {page_num + 1}. Check HTML structure.")
 
-                logger.info("Processing job IDs...")
                 for link in job_links:
                     job_id = link[job_link_data_attr]
-
-                    # Increment the total_job_ids_found counter
                     total_job_ids_found += 1
 
-                    # Check if job_id exists in database
+                    # Check if the job ID already exists
                     exists = await sync_to_async(JobRecord.objects.filter(job_id=job_id).exists)()
                     if exists:
                         logger.info(f"Job ID {job_id} already exists in the database. Skipping.")
                     else:
-                        # Create new JobRecord
                         job_record = JobRecord(
                             job_id=job_id,
                             source='Indeed',
@@ -176,23 +221,23 @@ async def extract_job_ids(job_title=None, location=None, user_agent=None, headle
                         )
                         await sync_to_async(job_record.save)()
                         logger.info(f"Job ID {job_id} saved to database.")
-                        # Increment the new_job_ids_saved counter
                         new_job_ids_saved += 1
 
-                    # Append the job_id to all_job_ids to write to CSV later
                     all_job_ids.append(job_id)
+
+                # Random sleep between pages
+                page_delay = random.uniform(1, 2.5)
+                logger.info(f"Sleeping for {page_delay:.2f} seconds before the next page...")
+                await asyncio.sleep(page_delay)
 
             except Exception as e:
                 logger.error(f"Failed to load page {page_num + 1}: {e}")
 
-        # Generate a timestamp for the filename
+        # Generate output CSV
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-
-        # Create the output CSV filename with the timestamp
         csv_filename = f'indeed_job_ids_{timestamp}.csv'
         output_file_path = os.path.join(output_dir, csv_filename)
 
-        # Save the job IDs to the CSV file in the output directory
         try:
             with open(output_file_path, 'w', newline='', encoding='utf-8') as csvfile:
                 writer = csv.writer(csvfile)
@@ -204,14 +249,11 @@ async def extract_job_ids(job_title=None, location=None, user_agent=None, headle
             logger.error(f"Failed to write CSV file at {output_file_path}: {e}")
 
         logger.info("Closing browser...")
-        # Close the browser
         await browser.close()
         logger.info("Browser closed. Extraction process completed.")
 
-    # Record the end time
     end_time = timezone.now()
 
-    # Prepare the result data
     result = {
         'message': 'Scraping completed successfully',
         'scrape_session_id': scrape_session_id,
@@ -219,7 +261,7 @@ async def extract_job_ids(job_title=None, location=None, user_agent=None, headle
         'new_job_ids_saved': new_job_ids_saved,
         'start_time': start_time.isoformat(),
         'end_time': end_time.isoformat(),
-        'csv_file_name': csv_filename  # Include the CSV file name
+        'csv_file_name': csv_filename
     }
 
     return result
